@@ -4,19 +4,23 @@ const app = express();
 app.use(express.json());
 
 // ==========================================
-// CẤU HÌNH - ĐIỀN KEY CỦA BẠN VÀO ĐÂY
+// CẤU HÌNH
 // ==========================================
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY; // sk-ant-...
-const PANCAKE_API_KEY = process.env.PANCAKE_API_KEY; // key từ Pancake
-// Lưu lịch sử chat từng khách (trong RAM)
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const PANCAKE_API_KEY = process.env.PANCAKE_API_KEY;
+const PAGE_ID = "271557229384823"; // Ngọc Linh Store
+const POLL_INTERVAL = 5000; // Kiểm tra tin mỗi 5 giây
+
+// Lưu lịch sử chat và tin đã xử lý
 const conversations = {};
+const processedMessages = new Set();
 
 // ==========================================
 // SYSTEM PROMPT - Nhân viên Ngọc Linh Store
 // ==========================================
 const SYSTEM_PROMPT = `Bạn là nhân viên tư vấn bán hàng của Ngọc Linh Store - shop thời trang và phụ kiện.
 
-NHIỆM VỤ CỦA BẠN:
+NHIỆM VỤ:
 - Chào hỏi thân thiện, nhiệt tình
 - Tư vấn sản phẩm thời trang, phụ kiện phù hợp với khách
 - Hỏi size, màu sắc, sở thích của khách
@@ -27,55 +31,86 @@ NHIỆM VỤ CỦA BẠN:
 CÁCH TRẢ LỜI:
 - Ngắn gọn, tự nhiên như nhắn tin thật
 - Dùng emoji vừa phải 😊
-- Không trả lời quá dài, tối đa 4-5 câu mỗi lần
-- Nếu khách hỏi giá mà không có thông tin, nói "Em sẽ báo giá cụ thể ngay ạ"
+- Tối đa 4-5 câu mỗi lần
 - Luôn kết thúc bằng câu hỏi để duy trì hội thoại
 
-KHI CHỐT ĐƠN: Hỏi lần lượt:
+KHI CHỐT ĐƠN hỏi lần lượt:
 1. Tên khách
-2. Số điện thoại  
+2. Số điện thoại
 3. Địa chỉ giao hàng
 4. Xác nhận lại toàn bộ đơn
 
-QUAN TRỌNG: Chỉ trả lời bằng tiếng Việt.`;
+Chỉ trả lời bằng tiếng Việt.`;
 
 // ==========================================
-// NHẬN WEBHOOK TỪ PANCAKE
+// LẤY DANH SÁCH HỘI THOẠI MỚI TỪ PANCAKE
 // ==========================================
-app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // Phản hồi Pancake ngay
+async function getConversations() {
+  try {
+    const res = await axios.get(
+      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations`,
+      {
+        headers: { "X-API-KEY": PANCAKE_API_KEY },
+        params: { limit: 20, status: "open" }
+      }
+    );
+    return res.data.conversations || [];
+  } catch (err) {
+    console.error("Lỗi lấy hội thoại:", err.response?.data || err.message);
+    return [];
+  }
+}
+
+// ==========================================
+// LẤY TIN NHẮN MỚI NHẤT TRONG HỘI THOẠI
+// ==========================================
+async function getMessages(conversationId) {
+  try {
+    const res = await axios.get(
+      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages`,
+      {
+        headers: { "X-API-KEY": PANCAKE_API_KEY },
+        params: { limit: 10 }
+      }
+    );
+    return res.data.messages || [];
+  } catch (err) {
+    console.error("Lỗi lấy tin nhắn:", err.response?.data || err.message);
+    return [];
+  }
+}
+
+// ==========================================
+// GỬI TIN NHẮN TRẢ LỜI QUA PANCAKE
+// ==========================================
+async function sendMessage(conversationId, message) {
+  try {
+    await axios.post(
+      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages`,
+      { message },
+      { headers: { "X-API-KEY": PANCAKE_API_KEY } }
+    );
+    console.log(`✅ Đã gửi: ${message.substring(0, 50)}...`);
+  } catch (err) {
+    console.error("Lỗi gửi tin:", err.response?.data || err.message);
+  }
+}
+
+// ==========================================
+// GỌI CLAUDE ĐỂ TẠO PHẢN HỒI
+// ==========================================
+async function askClaude(customerId, userMessage) {
+  if (!conversations[customerId]) conversations[customerId] = [];
+
+  conversations[customerId].push({ role: "user", content: userMessage });
+
+  // Giữ tối đa 20 tin gần nhất
+  if (conversations[customerId].length > 20) {
+    conversations[customerId] = conversations[customerId].slice(-20);
+  }
 
   try {
-    const { messages, customer } = req.body;
-    if (!messages || messages.length === 0) return;
-
-    const lastMsg = messages[messages.length - 1];
-    if (lastMsg.type !== "customer") return; // Chỉ xử lý tin từ khách
-
-    const customerId = customer?.id || "unknown";
-    const customerMessage = lastMsg.message;
-    const conversationId = req.body.conversation_id;
-
-    console.log(`[${customerId}] Khách nhắn: ${customerMessage}`);
-
-    // Lấy lịch sử chat
-    if (!conversations[customerId]) {
-      conversations[customerId] = [];
-    }
-
-    // Thêm tin nhắn khách vào lịch sử
-    conversations[customerId].push({
-      role: "user",
-      content: customerMessage,
-    });
-
-    // Giới hạn lịch sử 20 tin gần nhất
-    if (conversations[customerId].length > 20) {
-      conversations[customerId] = conversations[customerId].slice(-20);
-    }
-
-    // Gọi Claude API
-    const claudeResponse = await axios.post(
+    const res = await axios.post(
       "https://api.anthropic.com/v1/messages",
       {
         model: "claude-sonnet-4-6",
@@ -92,37 +127,69 @@ app.post("/webhook", async (req, res) => {
       }
     );
 
-    const botReply = claudeResponse.data.content[0].text;
-    console.log(`[${customerId}] Bot trả lời: ${botReply}`);
-
-    // Lưu reply vào lịch sử
-    conversations[customerId].push({
-      role: "assistant",
-      content: botReply,
-    });
-
-    // Gửi trả lời về Pancake
-    await axios.post(
-      `https://pages.fm/api/v1/conversations/${conversationId}/messages`,
-      { message: botReply },
-      {
-        headers: {
-          "X-API-KEY": PANCAKE_API_KEY,
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    const reply = res.data.content[0].text;
+    conversations[customerId].push({ role: "assistant", content: reply });
+    return reply;
   } catch (err) {
-    console.error("Lỗi:", err.response?.data || err.message);
+    console.error("Lỗi Claude:", err.response?.data || err.message);
+    return null;
   }
-});
+}
 
-// Health check
+// ==========================================
+// VÒNG LẶP POLLING - Kiểm tra tin mỗi 5 giây
+// ==========================================
+async function pollMessages() {
+  const convList = await getConversations();
+
+  for (const conv of convList) {
+    const convId = conv.id;
+    const messages = await getMessages(convId);
+
+    if (!messages.length) continue;
+
+    // Lấy tin nhắn mới nhất từ khách
+    const lastMsg = messages[0]; // Tin mới nhất
+    if (!lastMsg) continue;
+
+    const msgId = lastMsg.id;
+    const isFromCustomer = lastMsg.from_page === false || lastMsg.type === "customer";
+
+    // Bỏ qua nếu đã xử lý hoặc không phải tin từ khách
+    if (processedMessages.has(msgId) || !isFromCustomer) continue;
+
+    processedMessages.add(msgId);
+
+    // Giới hạn set không quá lớn
+    if (processedMessages.size > 1000) {
+      const first = processedMessages.values().next().value;
+      processedMessages.delete(first);
+    }
+
+    const customerId = conv.customer?.id || convId;
+    const text = lastMsg.message || lastMsg.text || "";
+
+    if (!text) continue;
+
+    console.log(`📩 [${customerId}] Khách: ${text}`);
+
+    const reply = await askClaude(customerId, text);
+    if (reply) {
+      await sendMessage(convId, reply);
+    }
+  }
+}
+
+// Bắt đầu polling
+setInterval(pollMessages, POLL_INTERVAL);
+console.log("🤖 Bot Ngọc Linh Store đang chạy, kiểm tra tin mỗi 5 giây...");
+
+// Health check endpoint
 app.get("/", (req, res) => {
-  res.send("Ngọc Linh Store Bot đang chạy ✅");
+  res.send("✅ Ngọc Linh Store Bot đang hoạt động!");
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server chạy tại port ${PORT}`);
+  console.log(`🚀 Server chạy tại port ${PORT}`);
 });
