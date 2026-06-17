@@ -35,87 +35,37 @@ KHI CHỐT ĐƠN hỏi lần lượt:
 
 Chỉ trả lời bằng tiếng Việt.`;
 
-// Thử nhiều cách auth khác nhau
-function getPancakeHeaders() {
-  return {
-    "Authorization": `Bearer ${PANCAKE_TOKEN}`,
-    "Content-Type": "application/json"
-  };
-}
-
-async function getConversations() {
+async function apiGet(url, params = {}) {
   try {
-    // Thử cách 1: Bearer token
-    const res = await axios.get(
-      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations`,
-      {
-        headers: getPancakeHeaders(),
-        params: { limit: 20 }
-      }
-    );
-    console.log("✅ Kết nối Pancake thành công!");
-    return res.data.conversations || [];
+    const res = await axios.get(url, {
+      headers: { "Authorization": `Bearer ${PANCAKE_TOKEN}` },
+      params
+    });
+    return res.data;
   } catch (err) {
-    const errData = err.response?.data;
-    console.error("Lỗi Pancake:", JSON.stringify(errData));
-    
-    // Thử cách 2: access_token trong params
     try {
-      const res2 = await axios.get(
-        `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations`,
-        { params: { limit: 20, access_token: PANCAKE_TOKEN } }
-      );
-      console.log("✅ Kết nối Pancake cách 2 thành công!");
-      return res2.data.conversations || [];
+      const res2 = await axios.get(url, { params: { ...params, access_token: PANCAKE_TOKEN } });
+      return res2.data;
     } catch (err2) {
-      console.error("Lỗi Pancake cách 2:", err2.response?.data || err2.message);
-      return [];
+      console.error("API GET lỗi:", err2.response?.data || err2.message);
+      return null;
     }
   }
 }
 
-async function getMessages(conversationId) {
+async function apiPost(url, data) {
   try {
-    const res = await axios.get(
-      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages`,
-      {
-        headers: getPancakeHeaders(),
-        params: { limit: 5 }
-      }
-    );
-    return res.data.messages || [];
+    await axios.post(url, data, {
+      headers: { "Authorization": `Bearer ${PANCAKE_TOKEN}`, "Content-Type": "application/json" }
+    });
+    return true;
   } catch (err) {
-    // Thử cách 2
     try {
-      const res2 = await axios.get(
-        `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages`,
-        { params: { limit: 5, access_token: PANCAKE_TOKEN } }
-      );
-      return res2.data.messages || [];
+      await axios.post(`${url}?access_token=${PANCAKE_TOKEN}`, data);
+      return true;
     } catch (err2) {
-      return [];
-    }
-  }
-}
-
-async function sendMessage(conversationId, message) {
-  try {
-    await axios.post(
-      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages`,
-      { message },
-      { headers: getPancakeHeaders() }
-    );
-    console.log(`✅ Đã gửi reply`);
-  } catch (err) {
-    // Thử cách 2
-    try {
-      await axios.post(
-        `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages?access_token=${PANCAKE_TOKEN}`,
-        { message }
-      );
-      console.log(`✅ Đã gửi reply cách 2`);
-    } catch (err2) {
-      console.error("Lỗi gửi tin:", err2.response?.data || err2.message);
+      console.error("API POST lỗi:", err2.response?.data || err2.message);
+      return false;
     }
   }
 }
@@ -153,18 +103,39 @@ async function askClaude(customerId, userMessage) {
 }
 
 async function pollMessages() {
-  const convList = await getConversations();
+  const data = await apiGet(`https://pages.fm/api/v1/pages/${PAGE_ID}/conversations`, { limit: 10 });
+  if (!data) return;
+
+  const convList = data.conversations || [];
+  console.log(`🔍 Tìm thấy ${convList.length} hội thoại`);
+
   for (const conv of convList) {
     const convId = conv.id;
-    const messages = await getMessages(convId);
+    const msgData = await apiGet(
+      `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${convId}/messages`,
+      { limit: 3 }
+    );
+    if (!msgData) continue;
+
+    const messages = msgData.messages || [];
     if (!messages.length) continue;
 
     const lastMsg = messages[0];
-    if (!lastMsg) continue;
-
     const msgId = lastMsg.id;
-    const isFromCustomer = lastMsg.from_page === false || lastMsg.sender_id !== PAGE_ID;
-    if (processedMessages.has(msgId) || !isFromCustomer) continue;
+
+    // Log để debug
+    console.log(`💬 Conv ${convId} - Tin cuối: "${lastMsg.message || lastMsg.text || ''}" | from_page: ${lastMsg.from_page} | type: ${lastMsg.type}`);
+
+    // Bỏ qua tin đã xử lý
+    if (processedMessages.has(msgId)) continue;
+
+    // Chỉ xử lý tin từ KHÁCH (không phải từ page/bot)
+    const isFromCustomer = lastMsg.from_page === false || lastMsg.from_page === 0 || lastMsg.type === "customer";
+    if (!isFromCustomer) {
+      console.log(`⏭️ Bỏ qua - tin từ page/bot`);
+      processedMessages.add(msgId);
+      continue;
+    }
 
     processedMessages.add(msgId);
     if (processedMessages.size > 1000) {
@@ -176,9 +147,15 @@ async function pollMessages() {
     const text = lastMsg.message || lastMsg.text || "";
     if (!text.trim()) continue;
 
-    console.log(`📩 Khách [${customerId}]: ${text}`);
+    console.log(`📩 KHÁCH [${customerId}]: ${text}`);
     const reply = await askClaude(customerId, text);
-    if (reply) await sendMessage(convId, reply);
+    if (reply) {
+      const sent = await apiPost(
+        `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${convId}/messages`,
+        { message: reply }
+      );
+      if (sent) console.log(`✅ Đã reply: ${reply.substring(0, 50)}...`);
+    }
   }
 }
 
