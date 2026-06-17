@@ -3,21 +3,14 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-// ==========================================
-// CẤU HÌNH
-// ==========================================
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const PANCAKE_API_KEY = process.env.PANCAKE_API_KEY;
-const PAGE_ID = "271557229384823"; // Ngọc Linh Store
-const POLL_INTERVAL = 5000; // Kiểm tra tin mỗi 5 giây
+const PAGE_ID = "271557229384823";
+const POLL_INTERVAL = 5000;
 
-// Lưu lịch sử chat và tin đã xử lý
 const conversations = {};
 const processedMessages = new Set();
 
-// ==========================================
-// SYSTEM PROMPT - Nhân viên Ngọc Linh Store
-// ==========================================
 const SYSTEM_PROMPT = `Bạn là nhân viên tư vấn bán hàng của Ngọc Linh Store - shop thời trang và phụ kiện.
 
 NHIỆM VỤ:
@@ -42,16 +35,13 @@ KHI CHỐT ĐƠN hỏi lần lượt:
 
 Chỉ trả lời bằng tiếng Việt.`;
 
-// ==========================================
-// LẤY DANH SÁCH HỘI THOẠI MỚI TỪ PANCAKE
-// ==========================================
 async function getConversations() {
   try {
     const res = await axios.get(
       `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations`,
       {
         headers: { "X-API-KEY": PANCAKE_API_KEY },
-        params: { limit: 20, status: "open" }
+        params: { limit: 20 }
       }
     );
     return res.data.conversations || [];
@@ -61,16 +51,13 @@ async function getConversations() {
   }
 }
 
-// ==========================================
-// LẤY TIN NHẮN MỚI NHẤT TRONG HỘI THOẠI
-// ==========================================
 async function getMessages(conversationId) {
   try {
     const res = await axios.get(
       `https://pages.fm/api/v1/pages/${PAGE_ID}/conversations/${conversationId}/messages`,
       {
         headers: { "X-API-KEY": PANCAKE_API_KEY },
-        params: { limit: 10 }
+        params: { limit: 5 }
       }
     );
     return res.data.messages || [];
@@ -80,9 +67,6 @@ async function getMessages(conversationId) {
   }
 }
 
-// ==========================================
-// GỬI TIN NHẮN TRẢ LỜI QUA PANCAKE
-// ==========================================
 async function sendMessage(conversationId, message) {
   try {
     await axios.post(
@@ -90,25 +74,18 @@ async function sendMessage(conversationId, message) {
       { message },
       { headers: { "X-API-KEY": PANCAKE_API_KEY } }
     );
-    console.log(`✅ Đã gửi: ${message.substring(0, 50)}...`);
+    console.log(`✅ Đã gửi reply`);
   } catch (err) {
     console.error("Lỗi gửi tin:", err.response?.data || err.message);
   }
 }
 
-// ==========================================
-// GỌI CLAUDE ĐỂ TẠO PHẢN HỒI
-// ==========================================
 async function askClaude(customerId, userMessage) {
   if (!conversations[customerId]) conversations[customerId] = [];
-
   conversations[customerId].push({ role: "user", content: userMessage });
-
-  // Giữ tối đa 20 tin gần nhất
   if (conversations[customerId].length > 20) {
     conversations[customerId] = conversations[customerId].slice(-20);
   }
-
   try {
     const res = await axios.post(
       "https://api.anthropic.com/v1/messages",
@@ -126,7 +103,6 @@ async function askClaude(customerId, userMessage) {
         },
       }
     );
-
     const reply = res.data.content[0].text;
     conversations[customerId].push({ role: "assistant", content: reply });
     return reply;
@@ -136,31 +112,22 @@ async function askClaude(customerId, userMessage) {
   }
 }
 
-// ==========================================
-// VÒNG LẶP POLLING - Kiểm tra tin mỗi 5 giây
-// ==========================================
 async function pollMessages() {
   const convList = await getConversations();
-
   for (const conv of convList) {
     const convId = conv.id;
     const messages = await getMessages(convId);
-
     if (!messages.length) continue;
 
-    // Lấy tin nhắn mới nhất từ khách
-    const lastMsg = messages[0]; // Tin mới nhất
+    const lastMsg = messages[0];
     if (!lastMsg) continue;
 
     const msgId = lastMsg.id;
-    const isFromCustomer = lastMsg.from_page === false || lastMsg.type === "customer";
-
-    // Bỏ qua nếu đã xử lý hoặc không phải tin từ khách
+    // Chỉ xử lý tin từ khách (không phải từ page)
+    const isFromCustomer = lastMsg.from_page === false;
     if (processedMessages.has(msgId) || !isFromCustomer) continue;
 
     processedMessages.add(msgId);
-
-    // Giới hạn set không quá lớn
     if (processedMessages.size > 1000) {
       const first = processedMessages.values().next().value;
       processedMessages.delete(first);
@@ -168,28 +135,21 @@ async function pollMessages() {
 
     const customerId = conv.customer?.id || convId;
     const text = lastMsg.message || lastMsg.text || "";
+    if (!text.trim()) continue;
 
-    if (!text) continue;
-
-    console.log(`📩 [${customerId}] Khách: ${text}`);
-
+    console.log(`📩 Khách [${customerId}]: ${text}`);
     const reply = await askClaude(customerId, text);
-    if (reply) {
-      await sendMessage(convId, reply);
-    }
+    if (reply) await sendMessage(convId, reply);
   }
 }
 
-// Bắt đầu polling
 setInterval(pollMessages, POLL_INTERVAL);
-console.log("🤖 Bot Ngọc Linh Store đang chạy, kiểm tra tin mỗi 5 giây...");
+console.log("🤖 Bot Ngọc Linh Store đang chạy...");
 
-// Health check endpoint
-app.get("/", (req, res) => {
-  res.send("✅ Ngọc Linh Store Bot đang hoạt động!");
-});
+app.get("/", (req, res) => res.send("✅ Ngọc Linh Store Bot đang hoạt động!"));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+// Dùng PORT từ Railway, mặc định 8080
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server chạy tại port ${PORT}`);
 });
